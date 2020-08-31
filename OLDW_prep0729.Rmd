@@ -1,0 +1,142 @@
+---
+title: "OLDW - Prep and EDA"
+author: "Ming-Chen (Amy) Lu, mingchlu@umich.edu"
+date: "`r format.Date(Sys.Date(), '%B %d, %Y')`"
+geometry: "left = 2cm, right = 2cm, top = 2cm, bottom = 2cm"
+output: 
+  html_document:
+    toc: yes
+    code_folding: "hide"
+---
+```{r setup, include = FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, 
+                      result = "asis", fig.align = "center",
+                      root.dir = '/Users/Amy/Desktop/AI/OLDW')
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(DT)
+```
+
+## Objective
+We aim to model online enrollments and track course growth.
+
+## Data Preprocessing and Visualizations
+
+**Input files:**  
+- oldw_class_mbrshp.csv  
+- oldw_class.csv  
+- oldw_crse.csv  
+
+The steps include:
+
+- Remove all courses that contains strings like "delete", "z_archive", and non-English titles.  
+- Take *Python Basics* as the first example.  
+- Gather relevant variables like `usr_key`, `class_key`, `class_begin_dttm`, and `mbrshp_begin_dttm`.
+
+```{r data cleaning, warning=FALSE}
+# 80: --------------------------------------------------------------------------
+# Read in files: ---------------------------------------------------------------
+setwd("/Users/Amy/Desktop/AI/OLDW")
+class_ = fread("./raw_data/oldw_class_7-2-20.csv", encoding='UTF-8')
+class_mbrshp = fread("./raw_data/oldw_class_mbrshp_7-1-20.csv",
+                     encoding='UTF-8')
+crse = fread("./raw_data/oldw_crse_7-2-20.csv", encoding='UTF-8')
+
+# Remove nonEnglish courses and archive/delete ones    
+crse = crse[!(grepl("[^ -~]", CRSE_NM) | grepl("z_|delete|DELETE", CRSE_NM))]
+
+# Subset to Python Basics: -----------------------------------------------------
+# Get class key for the course "Python Basics"
+crse_key = as.character(crse[CRSE_NM == "Python Basics", .(CRSE_KEY)])
+class_pb = class_[CRSE_KEY == crse_key & 
+                    SRC_SYS_CD %in% c("CRSAPHX", "CRSASPRK"), 
+                  lapply(.SD, function(x) as.Date(x, "%Y-%m-%d")), 
+                  by = .(CLASS_KEY), .SDcols = CLASS_BEGIN_DTTM:CLASS_END_DTTM]
+class_key_pb = unlist(class_pb[,.(CLASS_KEY)])
+class_mbrshp_pb = 
+  class_mbrshp[CLASS_KEY %in% class_key_pb & MBRSHP_ROLE_CD == 'LEARNER', 
+               .(USR_KEY, CLASS_KEY, 
+                 mbrshp_begin_date = as.Date(MBRSHP_BEGIN_DTTM, "%Y-%m-%d"))]
+
+# Remove unused data files
+rm(list = c("class_", "class_mbrshp", "crse"))
+```
+
+### Questions
+Below table shows that 937 users have a time span of enrollment over a year.
+
+So questions arise - *should we predict the enrollments of all members or unique users? Also, should we define a period of time to count for one enrollment?*
+
+```{r}
+cap = paste0("**Table 1.** *The table shows the differences of user's earliest",
+             " and latest enrollment dates that are greater than a year.*")
+class_mbrshp_pb[order(mbrshp_begin_date), 
+               .(first = head(mbrshp_begin_date, 1), 
+                 last = tail(mbrshp_begin_date, 1)), 
+               by = USR_KEY
+               ][, time_span := last - first
+               ][time_span > 365
+               ][order(-time_span)] %>%
+  DT::datatable(caption = cap)
+```
+
+
+```{r}
+# Join class_pb abd class_mbrshp_pb
+pb = merge(class_mbrshp_pb, class_pb, by = "CLASS_KEY", all.x = TRUE, all.y = FALSE)
+
+# A table showing number of times a user enrolled
+cap = paste0("**Table 2.** *The table shows the number of times a user ",
+             "enrolled*")
+
+pb[, .(enrol_per_user = .N), by=USR_KEY
+  ][ ,.(cnt = .N), by=enrol_per_user
+  ][order(cnt)] %>% 
+  DT::datatable(caption = cap)
+
+#options(DT.options = list(pageLength = 10))
+#datatable(wide, rownames = F, options = list(
+#  columnDefs = list(list(className = 'dt-center', targets = "_all"))))
+```
+### Assume all users only took a course once in a lifetime
+Another factor to be considered - *should we count the enrollments by the `class begin date` or by the `membership begin date`?*
+
+```{r plot_MbrshpBeginDate, fig.cap = cap}
+# Drop duplicated usr_key and leave the earliest mbrshp begin date
+pb_new = merge(unique(class_mbrshp_pb[order(mbrshp_begin_date)], by="USR_KEY"),
+               class_pb, by = "CLASS_KEY", all.x = TRUE, all.y = FALSE)
+#write.csv(pb_new, "dt_python_basics.csv")
+rm(class_mbrshp_pb)
+
+# Plot enrollments counted by mrbshp_begin_date
+plt = pb_new[, .(usr_cnt = .N), keyby=mbrshp_begin_date] %>%
+  .[, .(mbrshp_begin_date, usr_cnt, cum_usr_cnt = cumsum(usr_cnt))] %>%
+  melt(., id.vars = 1, measure.vars = 2:3)
+covid = as.numeric(unique(plt[mbrshp_begin_date == "2020-03-23"]$mbrshp_begin_date))
+
+ggplot(plt, aes(x = mbrshp_begin_date, y = value)) +
+  geom_line() + geom_point(size = .5) +
+  geom_vline(xintercept = covid, linetype = 2, color = "red", size = .5) +
+  facet_wrap(~variable, scales = "free_y", nrow = 2) +
+  theme_bw() + xlab("") + ylab("Counts") + ggtitle("Python Basics")
+
+cap = paste0("**Figure 1.** *Daily enrollment counted by membership begin ", 
+             "date*")
+```
+
+
+```{r plot_ClassBeginDate, fig.cap = cap}
+# Plot enrollments counted by class_begin_date
+plt1 = pb_new[, .(usr_cnt = .N), keyby=CLASS_BEGIN_DTTM] %>%
+  .[, .(CLASS_BEGIN_DTTM, usr_cnt, cum_usr_cnt = cumsum(usr_cnt))] %>%
+  melt(., id.vars = 1, measure.vars = 2:3)
+
+ggplot(plt1, aes(x = CLASS_BEGIN_DTTM, y = value)) +
+  geom_line() + geom_point(size = .5) +
+  geom_vline(xintercept = covid, linetype = 2, color = "red", size = .5) +
+  facet_wrap(~variable, scales = "free_y", nrow = 2) +
+  theme_bw() + xlab("") + ylab("Counts") + ggtitle("Python Basics")
+
+cap = paste0("**Figure 2.** *Bi-weeky enrollments counted by class begin date*")
+```

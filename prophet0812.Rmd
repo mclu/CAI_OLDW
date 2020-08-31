@@ -1,0 +1,316 @@
+---
+title: "OLDW - Prophet Model for Coursera, Parameters Tuning"
+author: "Ming-Chen (Amy) Lu, mingchlu@umich.edu"
+date: "`r format.Date(Sys.Date(), '%B %d, %Y')`"
+geometry: "left = 2cm, right = 2cm, top = 2cm, bottom = 2cm"
+output: 
+  pdf_document:
+    toc: yes
+    code_folding: hide
+---
+
+```{r setup, include = FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE,
+                      result = "asis", fig.align = "center")
+```
+
+# Data Prep
+
+I kept the earliest enrollment for each user and also removed courses with total enrollments fewer than 30.
+
+```{r Prep}
+# Libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(stringr)
+library(data.table)
+library(prophet)
+library(DT)
+setwd("/Users/Amy/Desktop/AI/OLDW")
+dt_coursera = fread("dt_coursera.csv")
+
+# Check total of data points for each course
+dt_crsa_par = dt_coursera[, .(horizon = .N %/% 8, 
+                              algorithm = ifelse(.N < 100, 'Newton', 'LBFGS')), 
+                          by=CRSE_NM]
+load("mod_ls.RData")
+load("CV_ls.RData")
+
+# A table showing all results: -------------------------------------------------
+eval_mod = function(x) {
+  rmse = round(sqrt(mean((x$y - x$yhat)^2)), 2)
+  mape = round(mean(abs(x$y - x$yhat) / x$y) * 100, 2)
+  return(list(rmse, mape))
+}
+
+tbl = as.data.frame(matrix(unlist(lapply(CV_ls, eval_mod)), 
+                           ncol = 2, byrow = TRUE))
+tbl["course"] = names(CV_ls)
+colnames(tbl)[1:2] = c("rmse", "mape")
+tbl = tbl %>% select(course, mape, rmse) %>% arrange(mape)
+```
+
+# First Attempt - Baseline Model
+Out of the 115 courses on Coursera, 89 courses was fitted. A table and plots for each course were generated to show the initial results.
+
+The model fitting process involves  
+1. Specifying `algorithm = 'Newton'` if sample size < 100; otherwise, `algorithm = 'LBFGS'`  
+2. Predicting for the next 30 days  
+3. Applying 10-fold cross validation to each course
+
+Others were set as default values.
+
+- The result shows 74 courses have mean absolute percentage error less than 10%.
+
+- From the ggplots of the remaining 15 courses, prophet models seemed not performing well for the step-like curve.
+
+```{r tbl}
+datatable(tbl, caption = "Table 1: Baseline Model.")
+```
+
+# Second Attempt - Models that has MAPE > 10%
+## Random Search
+The author of the package suggests that `changepoint_prior_scale` and `seasonality_prior_scale` are two parameters that are valuable to tune, so I'll start with these two. (https://github.com/facebook/prophet/issues/1058#issuecomment-510671302)
+
+Here we used random search to find the best set of parameters within the range. The random search tends to perform better than grid search for hyper-parameter optimization. (Figure 1 of this paper http://www.jmlr.org/papers/volume13/bergstra12a/bergstra12a.pdf; https://github.com/facebook/prophet/issues/886#issuecomment-474055687)
+
+Below shows the for loop for random search.
+
+```{r random search, eval=FALSE}
+# Set values for random search
+set.seed(2020)
+len = 10
+cp_prior_vals = runif(len, 0, 30)
+seas_prior_vals = runif(len, 10, 30)
+tune_ls = list()
+crse_name = tbl[tbl$mape > 10,]$course
+
+for(j in crse_name) {
+  # create empty vectors
+  rmse = vector(length = len)
+  mape = vector(length = len)
+  
+  # Random search `len` times for each course
+  for (i in 1:len) {
+    tryCatch({
+      algorithm = dt_crsa_par[CRSE_NM == j]$algorithm
+      mod = prophet(dt_coursera[CRSE_NM == j, .(ds, y)], 
+                    algorithm = algorithm,
+                    changepoint.prior.scale = cp_prior_vals[i],
+                    seasonality.prior.scale = seas_prior_vals[i])
+      future = make_future_dataframe(mod, periods = 30, freq = "day")
+      forecast = predict(mod, future)
+      horizon = dt_crsa_par[CRSE_NM == j]$horizon
+      cv = cross_validation(mod, horizon = horizon, units = "days")
+      
+      # Record RMSE and MAPE
+      rmse[i] = performance_metrics(cv, metrics = 'rmse', rolling_window = 1)$rmse
+      mape[i] = performance_metrics(cv, metrics = 'mape', rolling_window = 1)$mape*100
+    }, error = function(e){
+      cat("ERROR:", j, i, conditionMessage(e), "\n")})
+  }
+  
+  # Combine the search into df and save it to list
+  tryCatch({
+    df = data.frame(cbind(rep(j, len), cp_prior_vals, seas_prior_vals, 
+                          round(rmse, 2), round(mape, 2)))
+    colnames(df) = c("course", "cp_prior_vals", "seas_prior_vals",
+                     "rmse", "mape")
+    tune_ls[[j]] = df
+  }, error = function(e){ cat("ERROR:", j, ".", conditionMessage(e), "\n")})
+
+}
+```
+
+## Results
+All courses except "Financial Accounting for Construction Projects" have improved.
+
+```{r 2nd results}
+load("tune_ls.RData")
+# Unlist results and pick the best one for each course: -------------------------
+dt_tune = rbindlist(tune_ls) %>%
+  .[order(mape), .SD, by=course] %>%
+  .[(mape > 0) | (rmse > 0)] %>%
+  .[, .SD[1], by=course] %>%
+  merge(., tbl, by="course", suffixes=c("_new", "_old")) %>%
+  .[, .(course,
+        cp = round(as.numeric(cp_prior_vals), 2),
+        seas = round(as.numeric(seas_prior_vals), 2),
+        mape_old = round(as.numeric(mape_old), 2),
+        mape_new = round(as.numeric(mape_new), 2),
+        mape_imp = round(as.numeric(mape_old) - as.numeric(mape_new), 2),
+        rmse_old = round(as.numeric(rmse_old), 2),
+        rmse_new = round(as.numeric(rmse_new), 2),
+        rmse_imp = round(as.numeric(rmse_old) - as.numeric(rmse_new), 2))]
+
+datatable(dt_tune, options = list(autoWidth = TRUE, scrollX=TRUE),
+  caption = "Table 2: Second Attempt for Models with MAPE > 10%") %>%
+  formatStyle(columns = colnames(.), fontSize = '75%')
+```
+
+# Further Attempt - Look at course individually
+## Financial Accounting for Construction Projects
+This increasing trend doesn't show much of seasonal variation, so I decided to try smaller values of `seasonality.prior.scale` and ran with random search again.
+
+This time, 20 sets of parameters were generated through $Unif(0, 10)$ for *changepoint.prior.scale* and $Unif(0, 20)$ for *seasonality.prior.scale*.
+
+```{r Financial Accounting for Construction Projects}
+# Function to plot a course:-----------------------------------------------------
+runplot4one = function(crse_name, dt_tune) {
+  cp = dt_tune[course == crse_name]$cp
+  seas = dt_tune[course == crse_name]$seas
+  algorithm = dt_crsa_par[CRSE_NM == crse_name]$algorithm
+  mod = prophet(dt_coursera[CRSE_NM == crse_name, .(ds, y)], 
+                algorithm = algorithm, 
+                changepoint.prior.scale = cp,
+                seasonality.prior.scale = seas)
+  future = make_future_dataframe(mod, periods = 30, freq = "day")
+  forecast = predict(mod, future)
+  predicted_df = forecast[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')]
+  y = dt_coursera[CRSE_NM == crse_name]$y
+  length(y) = nrow(predicted_df)
+  df = cbind(predicted_df, y) %>% 
+    pivot_longer(cols = c("yhat", "y"))
+  
+  cols = c("y" = "black", "yhat" = "#f15c80")
+  gg = ggplot(df, aes(ds)) +
+    geom_ribbon(aes(ymin = yhat_lower, ymax = yhat_upper), fill="pink") +
+    geom_line(aes(y = value, group = name, color = name), size = .8, alpha=.9) +
+    scale_colour_manual(values = cols, 
+                        labels = c("Actual Value", "Predicted Value")) +
+    xlab("") + ylab("Cumulative Enrollments") + theme_bw() + 
+    ggtitle(crse_name) +
+    theme(legend.title = element_blank(),
+          legend.justification=c(0,1), 
+          legend.position=c(0.05, 0.95),
+          legend.background = element_blank(),
+          legend.key = element_blank())
+  return(gg)
+}
+
+# Function to tune hyper-parameters for a course: -------------------------------
+tune_par = function(crse_name, len, cp_prior_vals_min, cp_prior_vals_max,
+                    seas_prior_vals_min, seas_prior_vals_max) {
+  set.seed(2020)
+  cp_prior_vals = runif(len, cp_prior_vals_min, cp_prior_vals_max)
+  seas_prior_vals = runif(len, seas_prior_vals_min, seas_prior_vals_max)
+  rmse = vector(length = len)
+  mape = vector(length = len)
+  for (i in 1:len) {
+    tryCatch({
+      algorithm = dt_crsa_par[CRSE_NM == crse_name]$algorithm
+      mod = prophet(dt_coursera[CRSE_NM == crse_name, .(ds, y)], 
+                    algorithm = algorithm,
+                    changepoint.prior.scale = cp_prior_vals[i],
+                    seasonality.prior.scale = seas_prior_vals[i])
+      future = make_future_dataframe(mod, periods = 30, freq = "day")
+      forecast = predict(mod, future)
+      horizon = dt_crsa_par[CRSE_NM == crse_name]$horizon
+      cv = cross_validation(mod, horizon = horizon, units = "days")
+      rmse[i] = performance_metrics(cv, metrics = 'rmse', rolling_window = 1)$rmse
+      mape[i] = performance_metrics(cv, metrics = 'mape', rolling_window = 1)$mape*100
+    }, error = function(e){
+      cat("ERROR:", j, i, conditionMessage(e), "\n")})
+  }
+  
+  df = data.frame(cbind(rep(course, len), cp_prior_vals, seas_prior_vals, 
+                        round(rmse, 2), round(mape, 2)))
+  colnames(df) = c("course", "cp_prior_vals", "seas_prior_vals","rmse", "mape")
+  return(df)
+}
+# Plot the course
+crse_name = "Financial Accounting for Construction Projects"
+runplot4one(crse_name, dt_tune)
+```
+
+After further tuning, MAPE improved by 10.99%.
+
+|                | changepoint.prior.scale | seasonality.prior.scale | MAPE  |
+|----------------|-------------------------|-------------------------|-------|
+| Baseline Model | 0.05                    | 10                      | 16.86 |
+| Add seasonality.mode = "multiplicative"| |                         | 21.76 |
+| 2nd Model      | 4.08                    | 18.19                   | 24.54 |
+| 3rd Model      | 4.51                    | 0.026                   | 5.87  |
+
+## Using Python to Access Web Data
+The model predicts a steep drop around May 2020, but it seems not matching the current trend.
+
+```{r Using Python to Access Web Data-1}
+crse_name = "Using Python to Access Web Data"
+runplot4one(crse_name, dt_tune)
+```
+
+On 2015-10-30, we got 2705 enrollments which is a bit weird. I've gone back to check the raw data, it shouldn't be my coding error.
+
+20 sets of parameters were generated through $Unif(0, 10)$ for *changepoint.prior.scale* and $Unif(0, 20)$ for *seasonality.prior.scale*.
+
+```{r Using Python to Access Web Data-2}
+datatable(dt_coursera[CRSE_NM == "Using Python to Access Web Data", 
+          .(ds, CNT, y)], 
+          caption = "Table 3: Enrollments for Using Python to Access Web Data")
+```
+
+After further tuning, MAPE improved by 35.24%.
+
+|                | changepoint.prior.scale | seasonality.prior.scale | MAPE  |
+|----------------|-------------------------|-------------------------|-------|
+| Baseline Model | 0.05                    | 10                      | 55.79 |
+| Add seasonality.mode = "multiplicative"| |                         | 82.75 |
+| 2nd Model      | 18.56                   | 26.52                   | 37.34 |
+| 3rd Model      | 8.87                    | 0.13                    | 20.55 |
+
+## Introduction to Natural Language Processing
+Like what we observed earlier, the model didn't do well the the step-like curve. It predicts a upward trend for the next 30 days, while the trend of enrollments remains flat.
+
+```{r Introduction to Natural Language Processing-1}
+crse_name = "Introduction to Natural Language Processing"
+runplot4one(crse_name, dt_tune)
+```
+
+After further tuning, MAPE improved by 10.99%.
+
+|                | changepoint.prior.scale | seasonality.prior.scale | MAPE  |
+|----------------|-------------------------|-------------------------|-------|
+| Baseline Model | 0.05                    | 10                      | 35.61 |
+| Add seasonality.mode = "multiplicative"| |                         | 82.75 |
+| 2nd Model      | 11.79                   | 23.07                   | 19.28 |
+| 3rd Model      | 8.19                    | 0.01                    | 18.27 |
+
+## Understanding and Improving the US Healthcare System
+(Haven't started)
+
+# Issue
+- Inconsistent course name for "Programming for Everybody (Python)" and "Accounting for Decision Making".
+
+```{r issue-1}
+crse = fread("./raw_data/oldw_crse_7-2-20.csv", encoding='UTF-8')
+crse[grepl("Programming for Everybody|Accounting for Decision Making", CRSE_NM),
+     .(CRSE_NM, SRC_SYS_CD)] %>%
+  .[SRC_SYS_CD %in% c("CRSAPHX", "CRSASPRK")] %>% .[order(CRSE_NM)]
+```
+
+# Next Step...
+- Courses not yet fitted
+
+```{r Courses not yet explore}
+# Course not yet explore
+crse_unexplore = unique(dt_coursera$CRSE_NM)[!unique(dt_coursera$CRSE_NM) 
+                                             %in% tbl$course]
+crse_unexplore
+```
+
+# References
+- Implementing Facebook Prophet efficiently. https://towardsdatascience.com/implementing-facebook-prophet-efficiently-c241305405a3
+
+- Inconsistent diagnosis and how to improve MAPE. https://github.com/facebook/prophet/issues/1058
+
+**Links for better understand prophet**
+
+- Why do we need to fit the model before doing cross validation? https://github.com/facebook/prophet/issues/1409
+
+- Hyperparameter Tuning Snippet. https://github.com/facebook/prophet/issues/1381
+
+- Effect of changepoint_prior_scale and seasonality_prior_scale. https://github.com/facebook/prophet/issues/1320
+

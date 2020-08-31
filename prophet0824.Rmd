@@ -1,0 +1,227 @@
+---
+title: "OLDW - Prophet Model for Coursera Courses"
+author: "Ming-Chen (Amy) Lu, mingchlu@umich.edu"
+date: "`r format.Date(Sys.Date(), '%B %d, %Y')`"
+geometry: "left = 2cm, right = 2cm, top = 2cm, bottom = 2cm"
+output: 
+  html_document:
+    toc: yes
+    code_folding: hide
+---
+
+```{r setup, include = FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE,
+                      result = "asis", fig.align = "center")
+```
+
+**From previous meeting (2020/8/12)**
+
+- To focus on the "active courses", we'll filter the courses to have at least 20 enrollments in the last two months.
+
+- While models were fitted by the entire data set, the MAPE and RMSE will be computed using the data AFTER 2017 since due to the transition of the database, data can be messy and can not correctly reflect the enrollments.
+
+# Data Prep
+
+Only the earliest enrollment had been kept for each user and courses with less than 20 enrollments in the past two months were removed. I also manually removed the "Master of Applied Data Science Student Orientation" course and the courses with enrollments less than 30 days.
+
+```{r Prep}
+# Libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(stringr)
+library(data.table)
+library(prophet)
+library(DT)
+setwd("/Users/Amy/Desktop/OLDW")
+dt_coursera = fread("dt_coursera.csv")
+
+# Check total of data points for each course
+dt_crsa_par = dt_coursera[, .(horizon = .N %/% 8), by=CRSE_NM]
+load("mod_ls0814.RData")
+load("CV_ls0814.RData")
+
+# A table showing all results: -------------------------------------------------
+eval_mod = function(x) {
+  x[, yr := year(ds)] %>%
+    .[yr >= 2017, 
+      .(rmse = round(sqrt(mean((y - yhat)^2)), 2),
+        mape = round(mean(abs(y - yhat) / y) * 100, 2))] %>%
+    return()
+}
+```
+
+# First Attempt - Baseline Model
+Out of the 79 courses on Coursera, 78 courses was fitted. A table and plots for each course were generated to show the initial results.
+
+The model fitting process involves  
+1. Predicting for the next 30 days  
+2. Applying 10-fold cross validation to each course
+
+Others were set as default values.
+
+- The result shows 73 courses have mean absolute percentage error less than 10%.
+
+```{r tbl}
+tbl = read.csv("tbl.csv")
+datatable(tbl, caption = "Table 1: Baseline Model.")
+```
+
+Only "Applied Social Network Analysis in Python" encountered error during cross validation.
+
+
+# Random search for models that has MAPE > 5%
+The author of the package suggests that `changepoint_prior_scale` and `seasonality_prior_scale` are two parameters that are valuable to tune, so I'll start with these two. (https://github.com/facebook/prophet/issues/1058#issuecomment-510671302)
+
+Here we used random search to find the best set of parameters within the range. The random search tends to perform better than grid search for hyper-parameter optimization. (Figure 1 of this paper http://www.jmlr.org/papers/volume13/bergstra12a/bergstra12a.pdf; https://github.com/facebook/prophet/issues/886#issuecomment-474055687)
+
+Below shows the for loop for random search.
+
+```{r random search, eval=FALSE}
+# Set values for random search
+set.seed(2020)
+len = 10
+cp_prior_vals = runif(len, 0, 30)
+seas_prior_vals = runif(len, 10, 30)
+tune_ls = list()
+crse_name = tbl[tbl$mape > 10,]$course
+
+for(j in crse_name) {
+  # create empty vectors
+  rmse = vector(length = len)
+  mape = vector(length = len)
+  
+  # Random search `len` times for each course
+  for (i in 1:len) {
+    tryCatch({
+      algorithm = dt_crsa_par[CRSE_NM == j]$algorithm
+      mod = prophet(dt_coursera[CRSE_NM == j, .(ds, y)], 
+                    algorithm = algorithm,
+                    changepoint.prior.scale = cp_prior_vals[i],
+                    seasonality.prior.scale = seas_prior_vals[i])
+      future = make_future_dataframe(mod, periods = 30, freq = "day")
+      forecast = predict(mod, future)
+      horizon = dt_crsa_par[CRSE_NM == j]$horizon
+      cv = cross_validation(mod, horizon = horizon, units = "days")
+      
+      # Record RMSE and MAPE
+      mape[i] = eval_mod(cv)[['mape']]
+      rmse[i] = eval_mod(cv)[['rmse']]
+    }, error = function(e){
+      cat("ERROR:", j, i, conditionMessage(e), "\n")})
+  }
+  
+  # Combine the search into df and save it to list
+  tryCatch({
+    df = data.frame(cbind(rep(j, len), cp_prior_vals, seas_prior_vals, 
+                          round(rmse, 2), round(mape, 2)))
+    colnames(df) = c("course", "cp_prior_vals", "seas_prior_vals",
+                     "rmse", "mape")
+    tune_ls[[j]] = df
+  }, error = function(e){ cat("ERROR:", j, ".", conditionMessage(e), "\n")})
+
+}
+```
+
+## Results
+Out of 19 courses that have mape > 5%, 2 courses dropped a bit and 3 courses still have mape > 10%.
+
+```{r 2nd results}
+load("tune_ls_over5.RData")
+# Unlist results and pick the best one for each course: -------------------------
+idx = c("cp","seas","rmse_new", "mape_new","mape_old","rmse_old")
+dt_tune = rbindlist(tune_ls) %>%
+  merge(., tbl, by="course", suffixes=c("_new", "_old")) %>%
+  .[, (idx) := lapply(.SD, function(x) round(as.numeric(x), 2)), 
+    .SDcols=-"course"] %>% 
+  .[order(mape_new), .SD, by=course] %>%
+  .[(mape_new > 0) | (rmse_new > 0), .SD[1], by=course] %>%
+  .[, .(cp, seas, 
+        mape_old, mape_new, mape_imp = round(mape_old - mape_new, 2),
+        rmse_old, rmse_new, rmse_imp = round(rmse_old - rmse_new, 2)), 
+    by=course] %>% arrange(-mape_new)
+
+datatable(dt_tune, options = list(autoWidth = TRUE, scrollX=TRUE),
+  caption = "Table 2: Second Attempt for Models with MAPE > 10%") %>%
+  formatStyle(columns = colnames(.), fontSize = '75%')
+```
+
+# Further Attempt - Look at course individually
+#### 1. Successful Negotiation: Essential Strategies and Skills
+This one is a teach-out course, so we'll just ignore it.
+
+#### 2. Community Organizing for Social Justice
+
+```{r, eval=FALSE}
+course = "Community Organizing for Social Justice"
+tune_par(course, 20, 0, 30, 0, 10)
+```
+
+After further tuning, MAPE improved by 0.96%.
+
+|                | changepoint.prior.scale | seasonality.prior.scale | MAPE  |
+|----------------|-------------------------|-------------------------|-------|
+| Baseline Model | 0.05                    | 10                      | 11.84 |
+| 2nd Model      | 8.19                    | 0.02                    | 10.88 |
+| 3rd Model      | 12.7                    | 9.5                     | 11.61 |
+
+#### 3. The Finite Element Method for Problems in Physics
+
+```{r, eval=FALSE}
+course = "The Finite Element Method for Problems in Physics"
+tune_par(course, 10, 0, 30, 0, 10)
+```
+
+After further tuning, MAPE improved by 4.25%.
+
+|                | changepoint.prior.scale | seasonality.prior.scale | MAPE  |
+|----------------|-------------------------|-------------------------|-------|
+| Baseline Model | 0.05                    | 10                      | 10.64 |
+| 2nd Model      | 0.05                    | 0.02                    | 10.59 |
+| 3rd Model      | 2.02                    | 5.4                     | 6.39  |
+
+#### 4. Applied Social Network Analysis in Python
+
+```{r}
+course = "Applied Social Network Analysis in Python"
+dt = dt_coursera[CRSE_NM==course, .(ds, CNT, y)]
+mod = prophet(dt[, .(ds, y)], algorithm="LBFGS")
+future = make_future_dataframe(mod, periods = 30, freq = "day")
+forecast = predict(mod, future)
+datatable(dt)
+plot(mod, forecast) + ggtitle(course)
+```
+
+![](error msg.png "Error message of Applied Social Network Analysis in Python")
+
+# Conclusion
+Below shows the best result of each course.
+
+```{r}
+new = dt_tune[(dt_tune$mape_imp > 0) & (mape_new < 10), 
+              .(course, mape=mape_new)]
+df_final = rbind(tbl[!(tbl$course %in% new$course), c("course", "mape")], 
+                 new) %>% arrange(mape)
+rownames(df_final) = 1:nrow(df_final)
+df_final[df_final$course == "Community Organizing for Social Justice", 
+         "mape"] = 10.88
+df_final[df_final$course == "The Finite Element Method for Problems in Physics", 
+         "mape"] = 6.39
+df_final = df_final[-nrow(df_final),]
+datatable(df_final)
+```
+
+# References
+- Implementing Facebook Prophet efficiently. https://towardsdatascience.com/implementing-facebook-prophet-efficiently-c241305405a3
+
+- Inconsistent diagnosis and how to improve MAPE. https://github.com/facebook/prophet/issues/1058
+
+**Links for better understand prophet**
+
+- Why do we need to fit the model before doing cross validation? https://github.com/facebook/prophet/issues/1409
+
+- Hyperparameter Tuning Snippet. https://github.com/facebook/prophet/issues/1381
+
+- Effect of changepoint_prior_scale and seasonality_prior_scale. https://github.com/facebook/prophet/issues/1320
+
